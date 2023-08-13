@@ -1,0 +1,846 @@
+#!/usr/bin/env python3
+## w freestreaming
+
+import argparse
+from contextlib import contextmanager
+import datetime
+from collections import defaultdict, namedtuple
+from itertools import chain, islice, groupby, repeat
+import logging
+import math
+import os
+import pickle
+from random import choices
+import signal
+import subprocess
+import sys
+import tempfile
+
+import numpy as np
+import h5py
+
+import freestream
+import frzout
+
+
+def run_cmd(*args):
+    """
+    Run and log a subprocess.
+
+    """
+    cmd = ' '.join(args)
+    logging.info('running command: %s', cmd)
+
+    try:
+        proc = subprocess.run(
+            cmd.split(), check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True
+        )
+    except subprocess.CalledProcessError as e:
+        logging.error(
+            'command failed with status %d:\n%s',
+            e.returncode, e.output.strip('\n')
+        )
+        raise
+    else:
+        logging.debug(
+            'command completed successfully:\n%s',
+            proc.stdout.strip('\n')
+        )
+        return proc
+
+
+class Parser(argparse.ArgumentParser):
+    """
+    ArgumentParser that parses files with 'key = value' lines.
+
+    """
+    def __init__(self, *args, fromfile_prefix_chars='@', **kwargs):
+        super().__init__(
+            *args, fromfile_prefix_chars=fromfile_prefix_chars, **kwargs
+        )
+
+    def convert_arg_line_to_args(self, arg_line):
+        # split each line on = and prepend prefix chars to first arg so it is
+        # parsed as a long option
+        args = [i.strip() for i in arg_line.split('=', maxsplit=1)]
+        args[0] = 2*self.prefix_chars[0] + args[0]
+        return args
+
+
+parser = Parser(
+    usage=''.join('\n  %(prog)s ' + i for i in [
+        '[options] <results_file>',
+        'checkpoint <checkpoint_file>',
+        '-h | --help',
+    ]),
+    description='''
+Run relativistic heavy-ion collision events.
+
+In the first form, run events according to the given options (below) and write
+results to binary file <results_file>.
+
+In the second form, run the event saved in <checkpoint_file>, previously
+created by using the --checkpoint option and interrupting an event in progress.
+''',
+    formatter_class=argparse.RawDescriptionHelpFormatter
+)
+
+
+def parse_args_checkpoint():
+    """
+    Parse command line arguments according to the parser usage info.  Return a
+    tuple (args, ic) where `args` is a normal argparse.Namespace and `ic` is
+    either None or an np.array of the checkpointed initial condition.
+
+    First, check for the special "checkpoint" form, and if found, load and
+    return the args and checkpoint initial condition from the specified file.
+    If not, let the parser object handle everything.
+
+    This is a little hacky but it works fine.  Truth is, argparse can't do
+    exactly what I want here.  I suppose `docopt` might be a better option, but
+    it's not worth the effort to rewrite everything.
+
+    """
+    def usage():
+        parser.print_usage(sys.stderr)
+        sys.exit(2)
+
+    if len(sys.argv) == 1:
+        usage()
+
+    if sys.argv[1] == 'checkpoint':
+        if len(sys.argv) != 3:
+            usage()
+
+        path = sys.argv[2]
+
+        try:
+            with open(path, 'rb') as f:
+                args, ic, trigger = pickle.load(f)
+        except Exception as e:
+            msg = '{}: {}'.format(type(e).__name__, e)
+            if path not in msg:
+                msg += ": '{}'".format(path)
+            sys.exit(msg)
+
+        # as a simple integrity check, require that the checkpoint file is
+        # actually the file specified in the checkpointed args
+        if os.path.abspath(path) != args.checkpoint:
+            sys.exit(
+                "checkpoint file path '{}' does not match saved path '{}'"
+                .format(path, args.checkpoint)
+            )
+
+        return args, (ic, trigger)
+
+    return parser.parse_args(), None
+
+
+parser.add_argument(
+    'results', type=os.path.abspath,
+    help=argparse.SUPPRESS
+)
+parser.add_argument(
+    '--buffering', type=int, default=0, metavar='INT',
+    help='results file buffer size in bytes (default: no buffering)'
+)
+parser.add_argument(
+    '--nevents', type=int, metavar='INT',
+    help='number of events to run (default: run until interrupted)'
+)
+parser.add_argument(
+    '--rankvar', metavar='VAR',
+    help='environment variable containing process rank'
+)
+parser.add_argument(
+    '--rankfmt', metavar='FMT',
+    help='format string for rank integer'
+)
+parser.add_argument(
+    '--tmpdir', type=os.path.abspath, metavar='PATH',
+    help='temporary directory (default: {})'.format(tempfile.gettempdir())
+)
+parser.add_argument(
+    '--checkpoint', type=os.path.abspath, metavar='PATH',
+    help='checkpoint file [pickle format]'
+)
+parser.add_argument(
+    '--particles', type=os.path.abspath, metavar='PATH',
+    help='raw particle data file (default: do not save)'
+)
+parser.add_argument(
+    '--logfile', type=os.path.abspath, metavar='PATH',
+    help='log file (default: stdout)'
+)
+parser.add_argument(
+    '--loglevel', choices={'debug', 'info', 'warning', 'error', 'critical'},
+    default='info',
+    help='log level (default: %(default)s)'
+)
+parser.add_argument(
+    '--projectiles', type=str, default=('Pb Pb'),
+    help='collision system projectiles (default: %(default)s)'
+)
+parser.add_argument(
+    '--grid-scale', type=float, default=.2,
+    help='grid scale (default: %(default)s)'
+)
+parser.add_argument(
+    '--constit-width', type=float, default=.5,
+    help='constit width (default: %(default)s fm)'
+)
+parser.add_argument(
+    '--trento-args', default='', metavar='ARGS',
+    help="arguments passed to trento (default: '%(default)s')"
+)
+parser.add_argument(
+    '--tau-fs', type=float, default=.5, metavar='FLOAT',
+    help='free streaming time [fm] (default: %(default)s fm)'
+)
+parser.add_argument(
+    '--hydro-args', default='', metavar='ARGS',
+    help='arguments passed to osu-hydro (default: empty)'
+)
+parser.add_argument(
+    '--Tswitch', type=float, default=.150, metavar='FLOAT',
+    help='particlization temperature [GeV] (default: %(default).3f GeV)'
+)
+
+
+class StopEvent(Exception):
+    """ Raise to end an event early. """
+
+
+class Trento:
+    """
+    Generates p+Pb and Pb+Pb trento events using either a minimum bias
+    trigger or specialized high multiplicity trigger,
+
+    trigger low < mult/<mult> < trigger high,
+
+    to mimic the event selection used by experiment.
+
+    """
+    def __init__(self, args, batch_size=2*10**3, initial_file='initial.hdf'):
+        self.args = args
+        self.batch_size = batch_size
+        self.initial_file = initial_file
+
+        self.system = ' '.join(sorted(args.projectiles.split()))
+        self.pPb_event = (self.system == 'U2LiuQi U2LiuQi')
+
+        self.grid_step = args.grid_scale * args.constit_width
+        self.grid_max = (12 if self.pPb_event else 15)
+
+        self.used = defaultdict(set)
+
+    @property
+    def triggers(self):
+        """
+        All Pb+Pb observables use a minimum bias trigger, while some p+Pb
+        observables are calculated from a minimum bias trigger and others
+        use specific multiplicity triggers. This function yields trigger
+        bins (minimum bias or mult/<mult> cuts) for each event.
+
+        """
+        minimum_bias = (0, float('inf'))
+
+        pPb_bins = [((3.6443 , float('inf')),1),] # minimum baised, shujun
+        #pPb_bins = [
+        #    (  minimum_bias,  8),
+        #    ((1.218, 1.303),  4),
+        #    ((1.807, 1.891),  4),
+        #    ((2.395, 2.479),  4),
+        #    ((2.983, 3.067),  4),
+        #    ((3.571, 3.655),  4),
+        #    ((4.160, 4.244),  4),
+        #    ((4.748, 4.832),  4),
+        #    ((5.336, 5.420),  4),
+        #    ((1.250, 1.500), 15),
+        #    ((1.500, 2.000), 15),
+        #    ((2.000, 2.500), 15),
+        #    ((2.500, 3.000), 15),
+        #    ((3.000, 3.750), 15),
+        #    ((3.750, 4.625), 15),
+        #    ((4.625, 5.500), 15),
+        #    ((5.500, 6.000), 15),
+        #]
+
+        pPb_triggers, pPb_weights = zip(*pPb_bins)
+
+        while True:
+            trigger = choices(pPb_triggers, weights=pPb_weights).pop()
+            #yield trigger if self.pPb_event else minimum_bias
+            yield trigger
+
+    def find_event(self, trigger, norm=1, regen=False):
+        """
+        Searches through the batch of trento events and looks for the first
+        event which satisfies the specified trigger,
+
+        trigger min < mult/<mult> < trigger max
+
+        Rescale the initial condition normalization if the trigger bin edges
+        are larger than the maximum multiplicity of the minimum bias sample.
+
+        Run a new minimum bias sample if the trigger bin width is simply
+        too narrow to find a suitable event.
+
+        """
+        if regen or not os.path.exists(self.initial_file):
+            try:
+                os.remove(self.initial_file)
+                logging.info('running new batch of trento events')
+            except FileNotFoundError:
+                pass
+
+            run_cmd(
+                'trento {}'.format(self.system),
+                '--number-events {}'.format(self.batch_size),
+                '--grid-step {} --grid-max {}'.format(self.grid_step, self.grid_max),
+                '--constit-width {}'.format(self.args.constit_width),
+                '--output', self.initial_file,
+                self.args.trento_args,
+            )
+
+            self.used = defaultdict(set)
+
+        with h5py.File(self.initial_file, 'r') as f:
+
+            mean_mult = np.mean([ev.attrs['mult'] for ev in f.values()])
+            nev_used = len([ev for ev in chain(*self.used.values())])
+            batch_exhausted = (nev_used > int(1e-2*self.batch_size))
+            depleted_batch = (self.pPb_event and batch_exhausted)
+
+            def not_used(ev):
+                return ev.name not in self.used[trigger]
+
+            def trigger_hit(ev):
+                bin_min, bin_max = trigger
+                triggered = bin_min < norm*ev.attrs['mult']/mean_mult < bin_max
+                return triggered and not_used(ev) and not depleted_batch
+
+            for ev in filter(trigger_hit, f.values()):
+                self.used[trigger].add(ev.name)
+            #LiuQi add angle
+                spin_a = ev.attrs['spin_a']
+                spin_b = ev.attrs['spin_b']
+                tilt_a = ev.attrs['tilt_a']
+                tilt_b = ev.attrs['tilt_b']
+                return norm*np.array(ev),spin_a,spin_b,tilt_a,tilt_b
+
+            max_event = max(
+                filter(not_used, f.values()),
+                key=lambda ev: ev.attrs['mult'],
+                default=None
+            )
+
+            renormalize = (
+                (max_event is not None) and
+                (max_event.attrs['mult']/mean_mult < trigger[0]) and
+                not depleted_batch
+            )
+
+            if renormalize:
+                logging.info('trigger is too selective, increasing ic norm')
+                new_norm = trigger[1] / (max_event.attrs['mult']/mean_mult)
+                self.used[trigger].add(max_event.name)
+                return self.find_event(trigger, norm=new_norm)
+
+            return self.find_event(trigger, regen=True)
+
+    def __iter__(self):
+        """
+        Randomly samples the available triggers and yields one event per trigger
+
+        """
+        for trigger in self.triggers:
+
+            logging.info('initial entropy/<entropy> trigger: {}'.format(trigger))
+            ic,spin_a,spin_b,tilt_a,tilt_b = self.find_event(trigger) #LiuQi
+            # Write the checkpoint file _before_ starting the event so that
+            # even if the process is forcefully killed, the state will be
+            # saved.  If / when all events complete, delete the file.
+            if self.args.checkpoint is not None:
+                with open(self.args.checkpoint, 'wb') as cf:
+                    pickle.dump((self.args, ic, trigger), cf, pickle.HIGHEST_PROTOCOL)
+                logging.info('wrote checkpoint file %s', self.args.checkpoint)
+
+            yield ic, trigger,spin_a,spin_b,tilt_a,tilt_b #LiuQi
+
+
+def run_events(args, results_file, particles_file=None, checkpoint_ic=None):
+    """
+    Run events as determined by user input:
+
+        - Read options from `args`, as returned by `parser.parse_args()`.
+        - Write results to binary file object `results_file`.
+        - If `checkpoint_ic` is given, run only that IC.
+
+    Return True if at least one event completed successfully, otherwise False.
+
+    """
+    trento_events = Trento(args)
+    pPb_event = trento_events.pPb_event
+
+    grid_step = trento_events.grid_step
+    grid_n = math.ceil(2*trento_events.grid_max/grid_step)
+    grid_max = .5*grid_n*grid_step
+
+    logging.info(
+        'grid step = %.6f fm, n = %d, max = %.6f fm',
+        grid_step, grid_n, grid_max
+    )
+
+    if checkpoint_ic is None:
+        # if nevents was specified, generate that number of initial conditions
+        # otherwise generate indefinitely
+        initial_conditions = (
+            chain.from_iterable(trento_events for _ in repeat(None))
+            if args.nevents is None else
+            islice(trento_events, args.nevents)
+        )
+    else:
+        # just run the checkpointed IC
+        initial_conditions = [checkpoint_ic]
+
+    # create sampler HRG object (to be reused for all events)
+    hrg_kwargs = dict(species='urqmd', res_width=True)
+    hrg = frzout.HRG(args.Tswitch, **hrg_kwargs)
+
+    # append switching energy density to hydro arguments
+    eswitch = hrg.energy_density()
+    hydro_args = [args.hydro_args, 'edec={}'.format(eswitch)]
+
+    # arguments for "coarse" hydro pre-runs
+    # no viscosity, run down to low temperature 110 MeV
+    hydro_args_coarse = [
+        'etas_hrg=0 etas_min=0 etas_slope=0 zetas_max=0 zetas_width=0',
+        'edec={}'.format(frzout.HRG(.110, **hrg_kwargs).energy_density())
+    ]
+
+    def run_hydro(fs, event_size, coarse=False, dt_ratio=.25):
+        """
+        Run the initial condition contained in FreeStreamer object `fs` through
+        osu-hydro on a grid with approximate physical size `event_size` [fm].
+        Return a dict of freeze-out surface data suitable for passing directly
+        to frzout.Surface.
+
+        Initial condition arrays are cropped or padded as necessary.
+
+        If `coarse` is an integer > 1, use only every `coarse`th cell from the
+        initial condition arrays (thus increasing the physical grid step size
+        by a factor of `coarse`).  Ignore the user input `hydro_args` and
+        instead run ideal hydro down to a low temperature.
+
+        `dt_ratio` sets the timestep as a fraction of the spatial step
+        (dt = dt_ratio * dxy).  The SHASTA algorithm requires dt_ratio < 1/2.
+
+        """
+        dxy = grid_step * (coarse or 1)
+        ls = math.ceil(event_size/dxy)  # the osu-hydro "ls" parameter
+        n = 2*ls + 1  # actual number of grid cells
+
+        for fmt, f, arglist in [
+                ('ed', fs.energy_density, [()]),
+                ('u{}', fs.flow_velocity, [(1,), (2,)]),
+                ('pi{}{}', fs.shear_tensor, [(1, 1), (1, 2), (2, 2)]),
+        ]:
+            for a in arglist:
+                X = f(*a)
+
+                if coarse:
+                    X = X[::coarse, ::coarse]
+
+                diff = X.shape[0] - n
+                start = int(abs(diff)/2)
+
+                if diff > 0:
+                    # original grid is larger -> cut out middle square
+                    s = slice(start, start + n)
+                    X = X[s, s]
+                elif diff < 0:
+                    # original grid is smaller
+                    #  -> create new array and place original grid in middle
+                    Xn = np.zeros((n, n))
+                    s = slice(start, start + X.shape[0])
+                    Xn[s, s] = X
+                    X = Xn
+
+                X.tofile(fmt.format(*a) + '.dat')
+
+        dt = dxy*dt_ratio
+
+        run_cmd(
+            'osu-hydro',
+            't0={} dt={} dxy={} nls={}'.format(args.tau_fs, dt, dxy, ls),
+            *(hydro_args_coarse if coarse else hydro_args)
+        )
+
+        surface = np.fromfile('surface.dat', dtype='f8').reshape(-1, 16)
+
+        # end event if the surface is empty -- this occurs in ultra-peripheral
+        # events where the initial condition doesn't exceed Tswitch
+        if surface.size == 0:
+            raise StopEvent('empty surface')
+
+        # surface columns:
+        #   0    1  2  3         4         5         6    7
+        #   tau  x  y  dsigma_t  dsigma_x  dsigma_y  v_x  v_y
+        #   8     9     10    11    12    13    14    15
+        #   pitt  pitx  pity  pixx  pixy  piyy  pizz  Pi
+
+        # pack surface data into a dict suitable for passing to frzout.Surface
+        return dict(
+            zip(['x', 'sigma', 'v'], np.hsplit(surface, [3, 6, 8])),
+            pi=dict(zip(['xx', 'xy', 'yy'], surface.T[11:14])),
+            Pi=surface.T[15]
+        )
+
+    # species (name, ID) for identified particle observables
+    species = [
+        ('pion',     211),
+        ('kaon',     321),
+        ('proton',  2212),
+        ('Lambda',  3122),
+        ('Sigma0',  3212),
+        ('Xi',      3312),
+        ('Omega',   3334),
+    ]
+
+    # fully specify numeric data types, including endianness and size, to
+    # ensure consistency across all machines
+    float_t = '<f8'
+    int_t = '<i8'
+    complex_t = '<c16'
+
+    # special data types
+    nharmonic = 8
+    mean_pT_t = [('N', float_t), ('pT', float_t)]
+    flow_t = [('N', int_t), ('Qn', complex_t, nharmonic)]
+
+    # results "array" (one element)
+    # to be overwritten for each event
+    results = np.empty((), dtype=[
+        ('trigger', (float_t, 2)),
+        ('init_entropy', float_t),
+        ('nsamples', int_t),
+        ('dNch_deta', float_t),
+        ('dET_deta', float_t),
+        ('mean_pT', mean_pT_t),
+        ('iden_dN_dy', [(s, float_t) for (s, _) in species]),
+        ('iden_mean_pT', [(s, mean_pT_t) for (s, _) in species]),
+        ('pT_fluct', [('N', int_t), ('sum_pT', float_t), ('sum_pTsq', float_t)]),
+        ('flow', [('alice', flow_t), ('cms', flow_t)]),
+    ])
+
+    # UrQMD raw particle format
+    parts_dtype = [
+        ('sample', int),
+        ('ID', int),
+        ('charge', int),
+        ('pT', float),
+        ('ET', float),
+        ('mT', float),
+        ('phi', float),
+        ('y', float),
+        ('eta', float)
+    ]
+
+    def run_single_event(ic, trigger, spin_a ,spin_b ,tilt_a ,tilt_b ,event_number):
+        """
+        Run the initial condition event contained in HDF5 dataset object `ic`
+        and save observables to `results`.
+
+        """
+        results.fill(0)
+        results['trigger'] = trigger
+        results['init_entropy'] = ic.sum() * grid_step**2
+
+        assert all(n == grid_n for n in ic.shape)
+
+        logging.info(
+            'free streaming initial condition for %.3f fm',
+            args.tau_fs
+        )
+        fs = freestream.FreeStreamer(ic, grid_max, args.tau_fs)
+
+        # run coarse event on large grid and determine max radius
+        coarse = 3
+
+        rmax = math.sqrt((
+            run_hydro(
+                fs, event_size=(15 if pPb_event else 27), coarse=coarse
+            )['x'][:, 1:3]**2
+        ).sum(axis=1).max())
+        logging.info('rmax = %.3f fm', rmax)
+
+        # now run normal event with size set to the max radius
+        # and create sampler surface object
+        surface = frzout.Surface(**run_hydro(fs, event_size=rmax), ymax=2)#shujun
+        logging.info('%d freeze-out cells', len(surface))
+
+        minsamples, maxsamples = 10, 10**5  # reasonable range for nsamples
+        minparts = 10**5  # min number of particles to sample
+        nparts = 0  # for tracking total number of sampled particles
+
+        logging.info('sampling surface with frzout')
+
+        # sample particles and write to file
+        with open('particles_in.dat', 'w') as f:
+            for nsamples in range(1, maxsamples + 1):
+                parts = frzout.sample(surface, hrg)
+                if parts.size == 0:
+                    continue
+                nparts += parts.size
+                print('#', parts.size, file=f)
+                for p in parts:
+                    print(p['ID'], *p['x'], *p['p'], file=f)
+                if nparts >= minparts and nsamples >= minsamples:
+                    break
+
+        logging.info('produced %d particles in %d samples', nparts, nsamples)
+
+        if nparts == 0:
+            raise StopEvent('no particles produced')
+
+        # try to free some memory
+        # (up to ~a few hundred MiB for ultracentral collisions)
+        del surface
+
+        results['nsamples'] = nsamples
+
+        # hadronic afterburner
+        run_cmd('afterburner particles_in.dat particles_out.dat')
+
+        # read final particle data
+        with open('particles_out.dat', 'rb') as f:
+
+            # partition UrQMD file into oversamples
+            groups = groupby(f, key=lambda l: l.startswith(b'#'))
+            samples = filter(lambda g: not g[0], groups)
+
+            # iterate over particles and oversamples
+            parts_iter = (
+                tuple((nsample, *l.split()))
+                for nsample, (header, sample) in enumerate(samples, start=1)
+                for l in sample
+            )
+
+            parts = np.fromiter(parts_iter, dtype=parts_dtype)
+
+        # save raw particle data (optional)
+        if particles_file is not None:
+
+            # save event to hdf5 data set
+            logging.info('saving raw particle data')
+
+            this_data = particles_file.create_dataset(
+                'event_{}'.format(event_number),
+                data=parts, compression='lzf'
+            )
+            this_data.attrs['spin_a'] = spin_a
+            this_data.attrs['spin_b'] = spin_b
+            this_data.attrs['tilt_a'] = tilt_a
+            this_data.attrs['tilt_b'] = tilt_b
+            
+        logging.info('computing observables')
+
+        charged = (parts['charge'] != 0)
+        abs_eta = np.fabs(parts['eta'])
+        abs_ID = np.abs(parts['ID'])
+
+        pT = parts['pT']
+        phi = parts['phi']
+
+        eta_max = .8
+
+        # dNch/deta
+        results['dNch_deta'] = \
+            np.count_nonzero(charged & (abs_eta < eta_max)) / (2*eta_max) / nsamples
+
+        # dET/deta
+        results['dET_deta'] = \
+            parts['ET'][abs_eta < eta_max].sum() / (2*eta_max) / nsamples
+
+        # mean pT
+        cut = charged & (abs_eta < eta_max) & (.15 < pT) & (pT < 10.)
+        N = np.count_nonzero(cut)
+        results['mean_pT'] = (
+            N / nsamples,
+            (pT[cut].mean() if N > 0 else 0)
+        )
+
+        # identified dN/dy and mean pT
+        for name, pid in species:
+            cut = (abs_ID == pid) & (np.fabs(parts['y']) < .5)
+            N = np.count_nonzero(cut)
+            results['iden_dN_dy'][name] = N / nsamples
+            results['iden_mean_pT'][name] = (
+                N / nsamples,
+                (pT[cut].mean() if N > 0 else 0)
+            )
+
+        # mean pT fluctuations
+        cut = charged & (abs_eta < .8) & (.15 < pT) & (pT < 2.)
+
+        results['pT_fluct']['N'] = pT[cut].size
+        results['pT_fluct']['sum_pT'] = pT[cut].sum()
+        results['pT_fluct']['sum_pTsq'] = np.inner(pT[cut], pT[cut])
+
+        # anisotropic flows
+        alice_cut = charged & (abs_eta < .8) & (.2 < pT) & (pT < 5.)
+        cms_cut = charged & (abs_eta < .8) & (.3 < pT) & (pT < 3.)
+
+        for expt, cut in [('alice', alice_cut), ('cms', cms_cut)]:
+            results['flow'][expt]['N'] = phi[cut].size
+            results['flow'][expt]['Qn'] = [
+                np.exp(1j*n*phi[cut]).sum() for n in range(1, nharmonic + 1)
+            ]
+
+    nfail = 0
+
+    # run each initial condition event and save results to file
+    for n, (ic, trigger,spin_a,spin_b,tilt_a,tilt_b) in enumerate(initial_conditions, start=1):
+        logging.info('starting event %d', n)
+        logging.info('this event angle = {},{},{},{}'.format(spin_a,spin_b,tilt_a,tilt_b))
+        try:
+            run_single_event(ic, trigger,spin_a,spin_b,tilt_a,tilt_b,n)
+        except StopEvent as e:
+            if particles_file is not None:
+                particles_file.create_dataset(
+                    'event_{}'.format(n), shape=(0,), dtype=parts_dtype
+                )
+            logging.info('event stopped: %s', e)
+        except Exception:
+            logging.exception('event %d failed', n)
+            nfail += 1
+            if nfail > 3 and nfail/n > .5:
+                logging.critical('too many failures, stopping events')
+                break
+            logging.warning('continuing to next event')
+            continue
+
+        results_file.write(results.tobytes())
+        logging.info('event %d completed successfully', n)
+
+    # end of events: if running with a checkpoint, delete the file unless this
+    # was a failed re-run of a checkpoint event
+    if args.checkpoint is not None:
+        if checkpoint_ic is not None and nfail > 0:
+            logging.info(
+                'checkpoint event failed, keeping file %s',
+                args.checkpoint
+            )
+        else:
+            os.remove(args.checkpoint)
+            logging.info('removed checkpoint file %s', args.checkpoint)
+
+    return n > nfail
+
+
+def main():
+    args, checkpoint_ic = parse_args_checkpoint()
+
+    if checkpoint_ic is None:
+        # starting fresh -> truncate output files
+        filemode = 'w'
+
+        # must handle rank first since it affects paths
+        if args.rankvar:
+            rank = os.getenv(args.rankvar)
+            if rank is None:
+                sys.exit('rank variable {} is not set'.format(args.rankvar))
+
+            if args.rankfmt:
+                rank = args.rankfmt.format(int(rank))
+
+            # append rank to path arguments, e.g.:
+            #   /path/to/output.log  ->  /path/to/output/<rank>.log
+            for a in ['results', 'logfile', 'particles', 'checkpoint']:
+                value = getattr(args, a)
+                if value is not None:
+                    root, ext = os.path.splitext(value)
+                    setattr(args, a, os.path.join(root, rank) + ext)
+    else:
+        # running checkpoint event -> append to existing files
+        filemode = 'a'
+
+    os.makedirs(os.path.dirname(args.results), exist_ok=True)
+
+    if args.logfile is None:
+        logfile_kwargs = dict(stream=sys.stdout)
+    else:
+        logfile_kwargs = dict(filename=args.logfile, filemode=filemode)
+        os.makedirs(os.path.dirname(args.logfile), exist_ok=True)
+
+    if args.particles is not None:
+        os.makedirs(os.path.dirname(args.particles), exist_ok=True)
+
+    if args.checkpoint is not None:
+        os.makedirs(os.path.dirname(args.checkpoint), exist_ok=True)
+
+    logging.basicConfig(
+        level=getattr(logging, args.loglevel.upper()),
+        format='[%(levelname)s@%(relativeCreated)d] %(message)s',
+        **logfile_kwargs
+    )
+    logging.captureWarnings(True)
+
+    start = datetime.datetime.now()
+    if checkpoint_ic is None:
+        logging.info('started at %s', start)
+        logging.info('arguments: %r', args)
+    else:
+        logging.info(
+            'restarting from checkpoint file %s at %s',
+            args.checkpoint, start
+        )
+
+    # translate SIGTERM to KeyboardInterrupt
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    logging.debug('set SIGTERM handler')
+
+    @contextmanager
+    def h5py_file():
+        yield h5py.File(args.particles, 'w') if args.particles else None
+
+    with \
+            open(args.results, filemode + 'b',
+                 buffering=args.buffering) as results_file, \
+            h5py_file() as particles_file, \
+            tempfile.TemporaryDirectory(
+                prefix='hic-', dir=args.tmpdir) as workdir:
+        os.chdir(workdir)
+        logging.info('working directory: %s', workdir)
+
+        try:
+            status = run_events(args, results_file, particles_file, checkpoint_ic)
+        except KeyboardInterrupt:
+            # after catching the initial SIGTERM or interrupt, ignore them
+            # during shutdown -- this ensures everything will exit gracefully
+            # in case of additional signals (short of SIGKILL)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            status = True
+            logging.info(
+                'interrupt or signal at %s, cleaning up...',
+                datetime.datetime.now()
+            )
+            if args.checkpoint is not None:
+                logging.info(
+                    'current event saved in checkpoint file %s',
+                    args.checkpoint
+                )
+
+    end = datetime.datetime.now()
+    logging.info('finished at %s, %s elapsed', end, end - start)
+
+    if not status:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
